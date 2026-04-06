@@ -27,15 +27,24 @@ class ExportingTests(unittest.TestCase):
                         "transcript_language_code": "en",
                         "transcript_text": "Stocks fall as investors brace for inflation data.",
                         "transcript_segments": [{"text": "Stocks fall as investors brace for inflation data.", "start": 0, "duration": 3}],
+                        "ai_summary_points": [
+                            "Stocks fell as investors positioned ahead of upcoming inflation data and rate expectations."
+                        ],
+                        "ai_summary_model": "gemini-2.5-flash",
                     }
                 ],
                 timezone_name="UTC",
             ).decode("utf-8")
         )
-        self.assertEqual(payload["schema_version"], "newstoday.transcripts.v1")
+        self.assertEqual(payload["schema_version"], "newstoday.transcripts.v2")
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["items"][0]["video_id"], "abc123")
         self.assertIn("inflation", payload["items"][0]["transcript_text"].lower())
+        self.assertEqual(payload["items"][0]["summary_source"], "gemini-2.5-flash")
+        self.assertEqual(
+            payload["items"][0]["summary_points"][0],
+            "Stocks fell as investors positioned ahead of upcoming inflation data and rate expectations.",
+        )
 
     def test_csv_export_flattens_topics_and_summary_points(self) -> None:
         csv_text = export_transcripts_csv(
@@ -56,6 +65,8 @@ class ExportingTests(unittest.TestCase):
                     "transcript_language_code": "en",
                     "transcript_text": "Stocks fall as investors brace for inflation data.",
                     "transcript_segments": [{"text": "Stocks fall as investors brace for inflation data.", "start": 0, "duration": 3}],
+                    "ai_summary_points": ["Markets focused on inflation and the next policy signal from central banks."],
+                    "ai_summary_model": "gemini-2.5-flash",
                 }
             ],
             timezone_name="UTC",
@@ -63,6 +74,7 @@ class ExportingTests(unittest.TestCase):
         self.assertIn("video_id,url,channel_id", csv_text)
         self.assertIn("abc123", csv_text)
         self.assertIn("inflation", csv_text.lower())
+        self.assertIn("gemini-2.5-flash", csv_text)
 
 
 if __name__ == "__main__":

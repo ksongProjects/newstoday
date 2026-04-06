@@ -157,6 +157,21 @@ class YouTubeDataClient:
         cutoff: datetime,
         max_videos: int,
     ) -> list[dict[str, Any]]:
+        return self.fetch_uploads_window(
+            uploads_playlist_id=uploads_playlist_id,
+            start_at=cutoff,
+            end_at=None,
+            max_videos=max_videos,
+        )
+
+    def fetch_uploads_window(
+        self,
+        *,
+        uploads_playlist_id: str,
+        start_at: datetime,
+        end_at: datetime | None,
+        max_videos: int,
+    ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         page_token = ""
@@ -165,7 +180,7 @@ class YouTubeDataClient:
             params = {
                 "part": "snippet,contentDetails",
                 "playlistId": uploads_playlist_id,
-                "maxResults": str(min(50, max_videos)),
+                "maxResults": "50",
             }
             if page_token:
                 params["pageToken"] = page_token
@@ -177,9 +192,11 @@ class YouTubeDataClient:
                     continue
                 published_raw = content_details.get("videoPublishedAt") or item.get("snippet", {}).get("publishedAt")
                 published_at = parse_published_at(published_raw)
-                if published_at < cutoff:
+                if published_at < start_at:
                     stop_paging = True
                     break
+                if end_at is not None and published_at >= end_at:
+                    continue
                 items.append(item)
                 seen_ids.add(video_id)
                 if len(items) >= max_videos:
@@ -368,8 +385,19 @@ class YouTubeNewsCollector:
         videos = self.collect_metadata(hours=hours, selected_channels=selected_channels)
         return self.enrich_transcripts(videos)
 
-    def collect_metadata(self, *, hours: int, selected_channels: list[str] | None = None) -> list[VideoRecord]:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    def collect_metadata(
+        self,
+        *,
+        hours: int | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        selected_channels: list[str] | None = None,
+    ) -> list[VideoRecord]:
+        now = datetime.now(timezone.utc)
+        range_start = start_at.astimezone(timezone.utc) if start_at is not None else now - timedelta(hours=int(hours or 24))
+        range_end = end_at.astimezone(timezone.utc) if end_at is not None else None
+        if range_end is not None and range_end <= range_start:
+            raise SourceError("Video range end must be after the start.")
         targets = select_channel_targets(self.targets, selected_channels)
         videos: list[VideoRecord] = []
         failures: list[str] = []
@@ -384,9 +412,10 @@ class YouTubeNewsCollector:
                 )
                 if not uploads_playlist:
                     raise SourceError(f"No uploads playlist found for {target.display_name()}.")
-                playlist_items = self.client.fetch_recent_uploads(
+                playlist_items = self.client.fetch_uploads_window(
                     uploads_playlist_id=uploads_playlist,
-                    cutoff=cutoff,
+                    start_at=range_start,
+                    end_at=range_end,
                     max_videos=self.max_videos_per_channel,
                 )
                 details_map = self.client.fetch_video_details(

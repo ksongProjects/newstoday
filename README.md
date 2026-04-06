@@ -2,6 +2,8 @@
 
 NewsToday is a YouTube-first headline news collector. It monitors curated news channels, pulls recent uploads with the YouTube Data API, fetches transcripts with `youtube-transcript-api`, stores the results in SQLite, and generates a daily Markdown report centered on transcript-backed summaries.
 
+If you provide a Gemini API key, it can also generate `gemini-2.5-flash` summary bullets focused on world economics, finance, commodities, and stocks.
+
 It also includes a dense dark Streamlit UI for:
 
 - entering the YouTube API key for the current session
@@ -9,6 +11,7 @@ It also includes a dense dark Streamlit UI for:
 - editing, enabling, and removing channels directly in the UI
 - loading recent uploads without immediately transcribing everything
 - selecting only the videos you want to transcribe
+- optionally summarizing transcripts with Gemini 2.5 Flash
 - reviewing summaries and full transcripts in-app
 - exporting selected or filtered transcript results as JSON or CSV
 
@@ -18,12 +21,14 @@ It also includes a dense dark Streamlit UI for:
 - Fetches video metadata like title, publish time, duration, and view count
 - Pulls transcripts when captions are available
 - Builds transcript-based summary bullets for headline videos
+- Optionally replaces heuristic bullets with Gemini-generated economics and markets key points
 - Generates a daily report with a dedicated video-news section, topic watch, and transcript gap tracking
 
 ## Requirements
 
 - Python 3.10+
 - A YouTube Data API key in `YOUTUBE_API_KEY`
+- Optional: a Gemini API key in `GEMINI_API_KEY` for AI summaries
 
 Install dependencies:
 
@@ -38,6 +43,12 @@ python -m streamlit run newstoday/ui.py
 ```
 
 The UI is intentionally dark, compact, and data-dense so you can keep more channels, videos, and transcript detail on screen at once.
+
+In the sidebar you can optionally add a Gemini API key. When that key is present, the video queue can:
+
+- transcribe and summarize selected videos in one pass
+- summarize already-transcribed videos with `gemini-2.5-flash`
+- persist those AI summary bullets into SQLite so the report, transcript review tab, and exports all use the same result
 
 ## Quick Start
 

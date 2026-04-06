@@ -162,7 +162,7 @@ def annotate_video(video: dict[str, Any]) -> dict[str, Any]:
     annotated = dict(video)
     analysis_text = build_analysis_text(video)
     annotated["topic_labels"] = classify_topics(analysis_text)
-    annotated["summary_points"] = build_summary_points(video)
+    annotated["summary_points"] = summary_points_for_video(video)
     annotated["relevance_score"] = relevance_score(annotated)
     return annotated
 
@@ -179,7 +179,7 @@ def build_analysis_text(video: dict[str, Any]) -> str:
     )
 
 
-def build_summary_points(video: dict[str, Any], *, limit: int = 3) -> list[str]:
+def build_summary_points(video: dict[str, Any], *, limit: int | None = None) -> list[str]:
     segments = candidate_segments(video)
     if not segments:
         return []
@@ -192,11 +192,47 @@ def build_summary_points(video: dict[str, Any], *, limit: int = 3) -> list[str]:
             scored_segments.append((score, index, segment))
 
     if not scored_segments:
+        if limit is None:
+            return segments
         return segments[:limit]
 
-    chosen = sorted(scored_segments, key=lambda item: (-item[0], item[1]))[:limit]
-    chosen.sort(key=lambda item: item[1])
+    if limit is None:
+        chosen = sorted(scored_segments, key=lambda item: item[1])
+    else:
+        chosen = sorted(scored_segments, key=lambda item: (-item[0], item[1]))[:limit]
+        chosen.sort(key=lambda item: item[1])
     return [segment for _, _, segment in chosen]
+
+
+def stored_ai_summary_points(video: dict[str, Any], *, limit: int | None = None) -> list[str]:
+    raw_points = video.get("ai_summary_points") or []
+    points: list[str] = []
+    seen: set[str] = set()
+    for raw_point in raw_points:
+        point = normalize_text(str(raw_point or ""))
+        if not point:
+            continue
+        lowered = point.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        points.append(point)
+        if limit is not None and len(points) >= limit:
+            break
+    return points
+
+
+def summary_points_for_video(video: dict[str, Any], *, limit: int | None = None) -> list[str]:
+    ai_points = stored_ai_summary_points(video, limit=limit)
+    if ai_points:
+        return ai_points
+    return build_summary_points(video, limit=limit)
+
+
+def summary_source_for_video(video: dict[str, Any]) -> str:
+    if stored_ai_summary_points(video, limit=1):
+        return normalize_text(str(video.get("ai_summary_model", "") or "")) or "Gemini"
+    return "Transcript heuristic"
 
 
 def candidate_segments(video: dict[str, Any]) -> list[str]:

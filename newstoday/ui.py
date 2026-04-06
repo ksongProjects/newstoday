@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, time, timedelta, timezone
 import math
 import os
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import streamlit as st
 
+from newstoday.ai import GEMINI_SUMMARY_MODEL, GeminiSummaryError, summarize_transcript
 from newstoday.defaults import DEFAULT_CHANNELS, DEFAULT_TRANSCRIPT_LANGUAGES
 from newstoday.exporting import export_transcripts_csv, export_transcripts_json
 from newstoday.models import ChannelTarget, VideoRecord, format_duration, video_record_from_mapping
-from newstoday.reporting import build_summary_points, classify_topics
+from newstoday.reporting import classify_topics, summary_points_for_video, summary_source_for_video
 from newstoday.sources import (
     SourceError,
     TranscriptFetcher,
@@ -21,6 +22,7 @@ from newstoday.sources import (
     YouTubeNewsCollector,
 )
 from newstoday.storage import NewsStorage
+from newstoday.timezones import TIMEZONE_OPTIONS, normalize_timezone_name, resolve_timezone
 
 CHANNEL_COLUMNS = ["selected", "enabled", "label", "handle", "channel_id", "username"]
 TRANSCRIPT_TABLE_COLUMNS = ["published", "channel", "title", "lang", "topics", "summary", "video_id"]
@@ -80,16 +82,12 @@ def sidebar_settings() -> dict[str, Any]:
         "SQLite DB",
         value=os.getenv("NEWSTODAY_DB_PATH", "data/news.db"),
     )
-    timezone_name = st.sidebar.text_input(
+    default_timezone = normalize_timezone_name(os.getenv("NEWSTODAY_TIMEZONE", "UTC"))
+    timezone_name = st.sidebar.selectbox(
         "Timezone",
-        value=os.getenv("NEWSTODAY_TIMEZONE", "UTC"),
-    )
-    hours = st.sidebar.number_input(
-        "Lookback Hours",
-        min_value=1,
-        max_value=168,
-        value=int(os.getenv("NEWSTODAY_DEFAULT_HOURS", "24")),
-        step=1,
+        options=TIMEZONE_OPTIONS,
+        index=TIMEZONE_OPTIONS.index(default_timezone),
+        key="timezone_select",
     )
     max_videos_per_channel = st.sidebar.number_input(
         "Max Videos / Channel",
@@ -105,14 +103,28 @@ def sidebar_settings() -> dict[str, Any]:
         help="Only English is enabled for now.",
     )
     st.sidebar.caption("API key is required for channel search and metadata loading.")
+    st.sidebar.markdown("**Gemini Summaries**")
+    gemini_api_key = st.sidebar.text_input(
+        "Gemini API Key",
+        value=os.getenv("GEMINI_API_KEY", ""),
+        type="password",
+        help=(
+            "Optional. When set, NewsToday can generate transcript summaries with Gemini 2.5 Flash and save "
+            "them alongside the transcript."
+        ),
+    )
+    st.sidebar.caption(
+        "Optional. Uses gemini-2.5-flash for world economics, finance, commodities, and stocks key points."
+    )
 
     return {
         "api_key": api_key.strip(),
         "db_path": db_path.strip(),
-        "timezone": timezone_name.strip() or "UTC",
-        "hours": int(hours),
+        "timezone": timezone_name,
         "max_videos_per_channel": int(max_videos_per_channel),
         "transcript_languages": LANGUAGE_OPTIONS[transcript_language],
+        "gemini_api_key": gemini_api_key.strip(),
+        "gemini_model": GEMINI_SUMMARY_MODEL,
     }
 
 
@@ -143,31 +155,38 @@ def initialize_state() -> None:
 
 def render_channels_tab(settings: dict[str, Any]) -> None:
     st.subheader("Channel Discovery")
-    search_cols = st.columns([2.8, 0.9, 0.8, 0.8, 1.7])
+    search_cols = st.columns([2.5, 0.8, 0.8, 0.8, 0.8, 1.5])
     search_query = search_cols[0].text_input(
         "Search YouTube Channels",
         value=st.session_state.channel_search_query,
         placeholder="Reuters, CNBC, Bloomberg, BBC...",
         key="channel_search_input",
     )
-    search_clicked = search_cols[1].button("Search", use_container_width=True)
-    prev_clicked = search_cols[2].button(
+    search_clicked = search_cols[1].button("Search", width="stretch")
+    clear_clicked = search_cols[2].button(
+        "Clear",
+        width="stretch",
+        disabled=not (st.session_state.channel_search_query or st.session_state.channel_search_results),
+    )
+    prev_clicked = search_cols[3].button(
         "Prev",
-        use_container_width=True,
+        width="stretch",
         disabled=not st.session_state.channel_search_prev_token,
     )
-    next_clicked = search_cols[3].button(
+    next_clicked = search_cols[4].button(
         "Next",
-        use_container_width=True,
+        width="stretch",
         disabled=not st.session_state.channel_search_next_token,
     )
-    search_cols[4].caption(
+    search_cols[5].caption(
         f"Search page {st.session_state.channel_search_page} | "
         f"{len(st.session_state.channel_search_results)} results"
     )
 
     if search_clicked:
         run_channel_search(settings["api_key"], search_query, page_token="", next_page=1)
+    if clear_clicked:
+        clear_channel_search()
     if prev_clicked and st.session_state.channel_search_prev_token:
         run_channel_search(
             settings["api_key"],
@@ -195,11 +214,11 @@ def render_channels_tab(settings: dict[str, Any]) -> None:
     metrics[3].metric("Channel IDs", sum(bool(value) for value in current_df["channel_id"]))
 
     actions = st.columns([1.1, 1.1, 1.1, 4.7])
-    if actions[0].button("Load Defaults", use_container_width=True):
+    if actions[0].button("Load Defaults", width="stretch"):
         st.session_state.channel_rows = default_channel_rows()
         st.session_state.channel_page = 1
         st.rerun()
-    if actions[1].button("Remove Selected", use_container_width=True):
+    if actions[1].button("Remove Selected", width="stretch"):
         kept_rows = [row for row in st.session_state.channel_rows if not row.get("selected")]
         if len(kept_rows) != len(st.session_state.channel_rows):
             st.session_state.channel_rows = kept_rows
@@ -208,7 +227,7 @@ def render_channels_tab(settings: dict[str, Any]) -> None:
                 total_pages(len(st.session_state.channel_rows), CHANNEL_PAGE_SIZE),
             )
             st.rerun()
-    if actions[2].button("Clear All", use_container_width=True):
+    if actions[2].button("Clear All", width="stretch"):
         st.session_state.channel_rows = []
         st.session_state.channel_page = 1
         st.rerun()
@@ -223,7 +242,7 @@ def render_channels_tab(settings: dict[str, Any]) -> None:
     edited_page = st.data_editor(
         page_df,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key=f"channels_editor_page_{current_page}",
         column_config={
             "selected": st.column_config.CheckboxColumn("Rm", width="small"),
@@ -249,12 +268,31 @@ def render_channels_tab(settings: dict[str, Any]) -> None:
 def render_videos_tab(settings: dict[str, Any]) -> None:
     st.subheader("Video Queue")
     targets = channel_targets_from_rows(st.session_state.channel_rows)
+    ensure_video_date_range_state(settings["timezone"])
 
-    header = st.columns([1.2, 1.2, 1.2, 3.4])
-    load_clicked = header[0].button("Load Recent Videos", use_container_width=True)
-    clear_clicked = header[1].button("Clear Queue", use_container_width=True)
-    load_db_clicked = header[2].button("Load Recent From DB", use_container_width=True)
-    header[3].caption("Load metadata first, then choose only the videos you want to transcribe.")
+    controls = st.columns([1.2, 1.2, 1.1, 1.1, 1.1, 3.3])
+    start_date = controls[0].date_input(
+        "Start Date",
+        key="video_range_start",
+    )
+    end_date = controls[1].date_input(
+        "End Date",
+        key="video_range_end",
+    )
+    load_clicked = controls[2].button("Load Videos", width="stretch")
+    load_db_clicked = controls[3].button("Load DB", width="stretch")
+    clear_clicked = controls[4].button("Clear Queue", width="stretch")
+    controls[5].caption("Load YouTube metadata or stored rows for an exact local date range.")
+
+    if start_date > end_date:
+        st.error("Start date must be on or before end date.")
+        return
+
+    range_start, range_end = build_video_range_bounds(
+        start_date=start_date,
+        end_date=end_date,
+        timezone_name=settings["timezone"],
+    )
 
     if clear_clicked:
         st.session_state.video_rows = []
@@ -264,7 +302,7 @@ def render_videos_tab(settings: dict[str, Any]) -> None:
     if load_db_clicked:
         storage = NewsStorage(settings["db_path"])
         try:
-            rows = storage.fetch_recent_videos(settings["hours"])
+            rows = storage.fetch_videos_in_range(range_start, range_end)
         finally:
             storage.close()
         st.session_state.video_rows = preserve_video_selection(st.session_state.video_rows, rows)
@@ -285,7 +323,7 @@ def render_videos_tab(settings: dict[str, Any]) -> None:
                     transcript_languages=settings["transcript_languages"],
                 )
                 try:
-                    records = collector.collect_metadata(hours=settings["hours"])
+                    records = collector.collect_metadata(start_at=range_start, end_at=range_end)
                 except SourceError as exc:
                     st.error(str(exc))
                     records = []
@@ -304,12 +342,13 @@ def render_videos_tab(settings: dict[str, Any]) -> None:
                     existing_transcripts = sum(row.get("transcript_status") == "ok" for row in merged_rows)
                     if existing_transcripts:
                         st.success(
-                            f"Loaded {len(merged_rows)} videos. {existing_transcripts} already have saved transcripts."
+                            f"Loaded {len(merged_rows)} videos in the selected range. "
+                            f"{existing_transcripts} already have saved transcripts."
                         )
                     else:
-                        st.success(f"Loaded {len(merged_rows)} videos.")
+                        st.success(f"Loaded {len(merged_rows)} videos in the selected range.")
                 else:
-                    st.warning("No recent videos found.")
+                    st.warning("No videos found in the selected date range.")
 
     metrics = build_video_metrics(st.session_state.video_rows)
     metric_cols = st.columns(5)
@@ -360,7 +399,7 @@ def render_videos_tab(settings: dict[str, Any]) -> None:
     edited_table = st.data_editor(
         page_df[VIDEO_TABLE_COLUMNS] if not page_df.empty else page_df,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key=f"videos_editor_page_{current_page}",
         column_config={
             "selected": st.column_config.CheckboxColumn("Tx", width="small"),
@@ -388,9 +427,19 @@ def render_videos_tab(settings: dict[str, Any]) -> None:
     )
 
     selected_ids = [row["video_id"] for row in st.session_state.video_rows if row.get("selected")]
-    tx_cols = st.columns([1.2, 3.8])
-    transcribe_clicked = tx_cols[0].button("Transcribe Selected", use_container_width=True)
-    tx_cols[1].caption("Selected rows stay checked after transcript updates, so you can batch through the queue.")
+    tx_cols = st.columns([1.5, 1.4, 1.4, 2.7])
+    transcribe_label = "Transcribe + Summarize" if settings["gemini_api_key"] else "Transcribe Selected"
+    transcribe_clicked = tx_cols[0].button(transcribe_label, width="stretch")
+    summarize_clicked = tx_cols[1].button(
+        "Summarize Selected",
+        width="stretch",
+        disabled=not settings["gemini_api_key"],
+    )
+    clear_transcripts_clicked = tx_cols[2].button("Clear Transcripts", width="stretch")
+    tx_cols[3].caption(
+        "Selected rows stay checked after updates. When a Gemini key is set, transcription also writes "
+        "gemini-2.5-flash economics and markets bullets."
+    )
 
     if transcribe_clicked:
         if not selected_ids:
@@ -400,8 +449,35 @@ def render_videos_tab(settings: dict[str, Any]) -> None:
                 selected_ids=selected_ids,
                 transcript_languages=settings["transcript_languages"],
                 db_path=settings["db_path"],
+                gemini_api_key=settings["gemini_api_key"],
+                gemini_model=settings["gemini_model"],
             )
             st.session_state.transcript_page = 1
+            st.rerun()
+
+    if summarize_clicked:
+        if not selected_ids:
+            st.warning("Select at least one video to summarize.")
+        else:
+            summarize_selected_videos(
+                selected_ids=selected_ids,
+                db_path=settings["db_path"],
+                gemini_api_key=settings["gemini_api_key"],
+                gemini_model=settings["gemini_model"],
+            )
+            st.session_state.transcript_page = 1
+            st.rerun()
+
+    if clear_transcripts_clicked:
+        if not selected_ids:
+            st.warning("Select at least one video to clear transcript data.")
+        else:
+            cleared_count = clear_selected_transcripts(selected_ids=selected_ids, db_path=settings["db_path"])
+            st.session_state.transcript_page = 1
+            if cleared_count:
+                st.success(f"Cleared transcript data for {cleared_count} selected videos.")
+            else:
+                st.info("No transcript data needed to be cleared.")
             st.rerun()
 
 
@@ -444,7 +520,7 @@ def render_transcripts_tab(settings: dict[str, Any]) -> None:
     )
     st.dataframe(
         page_df[TRANSCRIPT_TABLE_COLUMNS] if not page_df.empty else page_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.caption(
@@ -473,27 +549,27 @@ def render_transcripts_tab(settings: dict[str, Any]) -> None:
         st.rerun()
 
     row = next(item for item in ok_rows if item["video_id"] == selected_id)
-    export_cols = st.columns([1.1, 1.1, 1.1, 1.1, 3.6])
+    export_cols = st.columns([1.0, 1.0, 1.0, 1.0, 1.1, 1.1, 2.0])
     export_cols[0].download_button(
         "Selected JSON",
         data=export_transcripts_json([row], timezone_name=settings["timezone"]),
         file_name=f"transcript-{selected_id}.json",
         mime="application/json",
-        use_container_width=True,
+        width="stretch",
     )
     export_cols[1].download_button(
         "Selected CSV",
         data=export_transcripts_csv([row], timezone_name=settings["timezone"]),
         file_name=f"transcript-{selected_id}.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
     export_cols[2].download_button(
         "Filtered JSON",
         data=export_transcripts_json(filtered_rows, timezone_name=settings["timezone"]),
         file_name=f"transcripts-filtered-{len(filtered_rows)}.json",
         mime="application/json",
-        use_container_width=True,
+        width="stretch",
         disabled=not filtered_rows,
     )
     export_cols[3].download_button(
@@ -501,14 +577,39 @@ def render_transcripts_tab(settings: dict[str, Any]) -> None:
         data=export_transcripts_csv(filtered_rows, timezone_name=settings["timezone"]),
         file_name=f"transcripts-filtered-{len(filtered_rows)}.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
         disabled=not filtered_rows,
     )
-    export_cols[4].caption(
-        "Exports use a single canonical transcript schema so we can swap in a stricter downstream format later."
+    summarize_current_clicked = export_cols[4].button(
+        "Summarize This",
+        width="stretch",
+        disabled=not settings["gemini_api_key"],
+    )
+    remove_current_clicked = export_cols[5].button("Remove This", width="stretch")
+    export_cols[6].caption(
+        "Exports use a single canonical transcript schema. Gemini summaries are included when they exist."
     )
 
-    summary_points = build_summary_points(row)
+    if summarize_current_clicked:
+        summarize_selected_videos(
+            selected_ids=[selected_id],
+            db_path=settings["db_path"],
+            gemini_api_key=settings["gemini_api_key"],
+            gemini_model=settings["gemini_model"],
+        )
+        st.rerun()
+
+    if remove_current_clicked:
+        cleared_count = clear_selected_transcripts(selected_ids=[selected_id], db_path=settings["db_path"])
+        if cleared_count:
+            st.session_state.transcript_page = 1
+            st.success("Removed the selected transcript.")
+        else:
+            st.info("That transcript was already cleared.")
+        st.rerun()
+
+    summary_points = summary_points_for_video(row)
+    summary_source = summary_source_for_video(row)
     topics = classify_topics(f"{row.get('title', '')} {row.get('description', '')} {row.get('transcript_text', '')}")
     top = st.columns([3.0, 1.2, 1.2, 1.2])
     top[0].markdown(f"**[{row['title']}]({row['url']})**")
@@ -522,6 +623,9 @@ def render_transcripts_tab(settings: dict[str, Any]) -> None:
     )
     if topics:
         st.markdown("**Topics:** " + ", ".join(topics))
+    st.caption(f"Summary source: {summary_source}")
+    if row.get("ai_summary_error"):
+        st.caption(f"Gemini summary issue: {row.get('ai_summary_error')}")
 
     left, right = st.columns([1.2, 2.8])
     with left:
@@ -538,23 +642,15 @@ def render_transcripts_tab(settings: dict[str, Any]) -> None:
             label_visibility="collapsed",
         )
 
-    segments = row.get("transcript_segments", []) or []
-    if segments:
-        seg_df = pd.DataFrame(
-            [
-                {
-                    "start": f"{segment.get('start', 0):.1f}",
-                    "duration": f"{segment.get('duration', 0):.1f}",
-                    "text": segment.get("text", ""),
-                }
-                for segment in segments
-            ]
-        )
-        st.markdown("**Segments**")
-        st.dataframe(seg_df, use_container_width=True, hide_index=True)
 
-
-def transcribe_selected_videos(*, selected_ids: list[str], transcript_languages: list[str], db_path: str) -> None:
+def transcribe_selected_videos(
+    *,
+    selected_ids: list[str],
+    transcript_languages: list[str],
+    db_path: str,
+    gemini_api_key: str,
+    gemini_model: str,
+) -> None:
     fetcher = TranscriptFetcher(transcript_languages)
     updates: list[VideoRecord] = []
     progress = st.progress(0.0, text="Starting transcript fetch...")
@@ -572,8 +668,22 @@ def transcribe_selected_videos(*, selected_ids: list[str], transcript_languages:
         updated["transcript_error"] = transcript_result["error"]
         updated["transcript_text"] = transcript_result["text"]
         updated["transcript_segments"] = transcript_result["segments"]
+        reset_ai_summary(updated)
+        if gemini_api_key and updated["transcript_status"] == "ok" and updated["transcript_text"]:
+            try:
+                summary = summarize_transcript(updated, api_key=gemini_api_key, model=gemini_model)
+                updated["ai_summary_points"] = summary.summary_points
+                updated["ai_summary_model"] = summary.model
+                updated["ai_summary_generated_at"] = datetime.now(timezone.utc).isoformat()
+                updated["ai_summary_error"] = ""
+            except GeminiSummaryError as exc:
+                updated["ai_summary_model"] = gemini_model
+                updated["ai_summary_error"] = str(exc)
         updates.append(video_record_from_mapping(updated))
-        progress.progress(index / total, text=f"Transcribed {index}/{total}: {row['title'][:80]}")
+        progress_label = "Transcribed"
+        if gemini_api_key and updated["transcript_status"] == "ok":
+            progress_label = "Transcribed and summarized"
+        progress.progress(index / total, text=f"{progress_label} {index}/{total}: {row['title'][:80]}")
 
     if updates:
         storage = NewsStorage(db_path)
@@ -585,6 +695,86 @@ def transcribe_selected_videos(*, selected_ids: list[str], transcript_languages:
             st.session_state.video_rows,
             [update.to_record() for update in updates],
         )
+
+
+def summarize_selected_videos(*, selected_ids: list[str], db_path: str, gemini_api_key: str, gemini_model: str) -> None:
+    if not gemini_api_key:
+        st.error("Enter a Gemini API key before summarizing transcripts.")
+        return
+
+    selected_rows = [
+        dict(item)
+        for item in st.session_state.video_rows
+        if item.get("video_id") in selected_ids and item.get("transcript_status") == "ok" and item.get("transcript_text")
+    ]
+    if not selected_rows:
+        st.warning("Select at least one transcript-backed video to summarize.")
+        return
+
+    updates: list[VideoRecord] = []
+    progress = st.progress(0.0, text="Starting Gemini summaries...")
+    total = len(selected_rows)
+    for index, row in enumerate(selected_rows, start=1):
+        updated = dict(row)
+        reset_ai_summary(updated)
+        try:
+            summary = summarize_transcript(updated, api_key=gemini_api_key, model=gemini_model)
+            updated["ai_summary_points"] = summary.summary_points
+            updated["ai_summary_model"] = summary.model
+            updated["ai_summary_generated_at"] = datetime.now(timezone.utc).isoformat()
+            updated["ai_summary_error"] = ""
+        except GeminiSummaryError as exc:
+            updated["ai_summary_model"] = gemini_model
+            updated["ai_summary_error"] = str(exc)
+        updates.append(video_record_from_mapping(updated))
+        progress.progress(index / total, text=f"Summarized {index}/{total}: {row['title'][:80]}")
+
+    storage = NewsStorage(db_path)
+    try:
+        storage.upsert_videos(updates)
+    finally:
+        storage.close()
+    st.session_state.video_rows = preserve_video_selection(
+        st.session_state.video_rows,
+        [update.to_record() for update in updates],
+    )
+
+
+def reset_ai_summary(row: dict[str, Any]) -> None:
+    row["ai_summary_points"] = []
+    row["ai_summary_model"] = ""
+    row["ai_summary_generated_at"] = ""
+    row["ai_summary_error"] = ""
+
+
+def clear_selected_transcripts(*, selected_ids: list[str], db_path: str) -> int:
+    storage = NewsStorage(db_path)
+    try:
+        cleared_count = storage.clear_transcripts(selected_ids)
+        refreshed_rows = storage.fetch_videos_by_ids(selected_ids)
+    finally:
+        storage.close()
+    st.session_state.video_rows = preserve_video_selection(st.session_state.video_rows, refreshed_rows)
+    return cleared_count
+
+
+def ensure_video_date_range_state(timezone_name: str) -> None:
+    if "video_range_start" in st.session_state and "video_range_end" in st.session_state:
+        return
+    zone = resolve_timezone(timezone_name)
+    today_local = datetime.now(zone).date()
+    default_hours = int(os.getenv("NEWSTODAY_DEFAULT_HOURS", "24"))
+    default_days = int(os.getenv("NEWSTODAY_DEFAULT_DAYS", str(max(1, math.ceil(default_hours / 24)))))
+    start_date = today_local - timedelta(days=max(default_days - 1, 0))
+    st.session_state.video_range_start = start_date
+    st.session_state.video_range_end = today_local
+
+
+def build_video_range_bounds(*, start_date: date, end_date: date, timezone_name: str) -> tuple[datetime, datetime]:
+    zone = resolve_timezone(timezone_name)
+    start_local = datetime.combine(start_date, time.min, tzinfo=zone)
+    end_local = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=zone)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
 def run_channel_search(api_key: str, query: str, *, page_token: str, next_page: int) -> None:
@@ -607,6 +797,16 @@ def run_channel_search(api_key: str, query: str, *, page_token: str, next_page: 
     st.session_state.channel_search_next_token = result["next_page_token"]
     st.session_state.channel_search_prev_token = result["prev_page_token"]
     st.session_state.channel_search_page = next_page
+    st.rerun()
+
+
+def clear_channel_search() -> None:
+    st.session_state.channel_search_query = ""
+    st.session_state.channel_search_results = []
+    st.session_state.channel_search_next_token = ""
+    st.session_state.channel_search_prev_token = ""
+    st.session_state.channel_search_page = 1
+    st.session_state.channel_search_input = ""
     st.rerun()
 
 
@@ -638,7 +838,7 @@ def render_channel_search_results() -> None:
         if cols[2].button(
             "Added" if already_added else "Add",
             key=f"add_channel_{index}",
-            use_container_width=True,
+            width="stretch",
             disabled=already_added,
         ):
             st.session_state.channel_rows = upsert_channel_row(st.session_state.channel_rows, item)
@@ -673,7 +873,7 @@ def build_transcript_table_df(
 
     for row in sorted(transcript_rows, key=lambda item: item.get("published_at", ""), reverse=True):
         topics = classify_topics(f"{row.get('title', '')} {row.get('description', '')} {row.get('transcript_text', '')}")
-        summary_points = build_summary_points(row)
+        summary_points = summary_points_for_video(row)
         haystack = " ".join(
             [
                 row.get("channel_title", ""),
@@ -718,7 +918,7 @@ def build_video_table_df(
 
     for row in sorted(video_rows, key=lambda item: item.get("published_at", ""), reverse=True):
         topics = classify_topics(f"{row.get('title', '')} {row.get('description', '')} {row.get('transcript_text', '')}")
-        summary_points = build_summary_points(row)
+        summary_points = summary_points_for_video(row)
         haystack = " ".join(
             [
                 row.get("channel_title", ""),
@@ -764,10 +964,10 @@ def paginated_dataframe(df: pd.DataFrame, *, state_key: str, page_size: int, lab
     st.session_state[state_key] = current_page
 
     controls = st.columns([1.0, 1.0, 1.0, 4.0])
-    if controls[0].button("Prev", key=f"{state_key}_prev", use_container_width=True, disabled=current_page <= 1):
+    if controls[0].button("Prev", key=f"{state_key}_prev", width="stretch", disabled=current_page <= 1):
         st.session_state[state_key] = current_page - 1
         st.rerun()
-    if controls[1].button("Next", key=f"{state_key}_next", use_container_width=True, disabled=current_page >= page_count):
+    if controls[1].button("Next", key=f"{state_key}_next", width="stretch", disabled=current_page >= page_count):
         st.session_state[state_key] = current_page + 1
         st.rerun()
     controls[2].metric("Page", f"{current_page}/{page_count}")
@@ -963,13 +1163,6 @@ def coerce_bool(value: Any, *, default: bool) -> bool:
     if text in {"false", "0", "no", "n", "off"}:
         return False
     return bool(value)
-
-
-def resolve_timezone(timezone_name: str) -> ZoneInfo:
-    try:
-        return ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        return ZoneInfo("UTC")
 
 
 def channel_targets_from_rows(rows: list[dict[str, Any]]) -> list[ChannelTarget]:

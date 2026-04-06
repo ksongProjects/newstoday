@@ -7,12 +7,12 @@ import io
 import json
 from datetime import datetime, timezone
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .models import format_duration
-from .reporting import build_summary_points, classify_topics
+from .reporting import classify_topics, stored_ai_summary_points, summary_points_for_video, summary_source_for_video
+from .timezones import resolve_timezone
 
-EXPORT_SCHEMA_VERSION = "newstoday.transcripts.v1"
+EXPORT_SCHEMA_VERSION = "newstoday.transcripts.v2"
 
 
 def build_export_rows(video_rows: list[dict[str, Any]], *, timezone_name: str = "UTC") -> list[dict[str, Any]]:
@@ -20,7 +20,8 @@ def build_export_rows(video_rows: list[dict[str, Any]], *, timezone_name: str = 
     rows: list[dict[str, Any]] = []
     for row in sorted(video_rows, key=lambda item: item.get("published_at", ""), reverse=True):
         topics = classify_topics(f"{row.get('title', '')} {row.get('description', '')} {row.get('transcript_text', '')}")
-        summary_points = build_summary_points(row)
+        summary_points = summary_points_for_video(row)
+        ai_summary_points = stored_ai_summary_points(row, limit=6)
         transcript_text = str(row.get("transcript_text", "") or "")
         published_at = str(row.get("published_at", "") or "")
         published_local = ""
@@ -52,6 +53,11 @@ def build_export_rows(video_rows: list[dict[str, Any]], *, timezone_name: str = 
                 "segment_count": len(row.get("transcript_segments", []) or []),
                 "topics": topics,
                 "summary_points": summary_points,
+                "summary_source": summary_source_for_video(row),
+                "summary_model": str(row.get("ai_summary_model", "") or ""),
+                "summary_generated_at": str(row.get("ai_summary_generated_at", "") or ""),
+                "summary_error": str(row.get("ai_summary_error", "") or ""),
+                "ai_summary_points": ai_summary_points,
                 "transcript_segments": list(row.get("transcript_segments", []) or []),
             }
         )
@@ -92,11 +98,16 @@ def export_transcripts_csv(video_rows: list[dict[str, Any]], *, timezone_name: s
         "transcript_is_translated",
         "transcript_error",
         "transcript_word_count",
-        "transcript_char_count",
-        "segment_count",
-        "topics",
-        "summary_points",
-        "transcript_text",
+            "transcript_char_count",
+            "segment_count",
+            "topics",
+            "summary_points",
+            "summary_source",
+            "summary_model",
+            "summary_generated_at",
+            "summary_error",
+            "ai_summary_points",
+            "transcript_text",
     ]
     writer = csv.DictWriter(buffer, fieldnames=fieldnames)
     writer.writeheader()
@@ -126,14 +137,12 @@ def export_transcripts_csv(video_rows: list[dict[str, Any]], *, timezone_name: s
                 "segment_count": row["segment_count"],
                 "topics": " | ".join(row["topics"]),
                 "summary_points": " | ".join(row["summary_points"]),
+                "summary_source": row["summary_source"],
+                "summary_model": row["summary_model"],
+                "summary_generated_at": row["summary_generated_at"],
+                "summary_error": row["summary_error"],
+                "ai_summary_points": " | ".join(row["ai_summary_points"]),
                 "transcript_text": row["transcript_text"],
             }
         )
     return buffer.getvalue().encode("utf-8")
-
-
-def resolve_timezone(timezone_name: str) -> ZoneInfo:
-    try:
-        return ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        return ZoneInfo("UTC")

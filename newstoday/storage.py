@@ -58,6 +58,10 @@ class NewsStorage:
                     transcript_error TEXT NOT NULL,
                     transcript_text TEXT NOT NULL,
                     transcript_segments_json TEXT NOT NULL,
+                    ai_summary_points_json TEXT NOT NULL DEFAULT '[]',
+                    ai_summary_model TEXT NOT NULL DEFAULT '',
+                    ai_summary_generated_at TEXT NOT NULL DEFAULT '',
+                    ai_summary_error TEXT NOT NULL DEFAULT '',
                     raw_payload_json TEXT NOT NULL,
                     collected_at TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -84,6 +88,23 @@ class NewsStorage:
                 );
                 """
             )
+            self._ensure_video_columns()
+
+    def _ensure_video_columns(self) -> None:
+        existing_columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(videos)").fetchall()
+        }
+        required_columns = {
+            "ai_summary_points_json": "TEXT NOT NULL DEFAULT '[]'",
+            "ai_summary_model": "TEXT NOT NULL DEFAULT ''",
+            "ai_summary_generated_at": "TEXT NOT NULL DEFAULT ''",
+            "ai_summary_error": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column_name, column_definition in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            self.conn.execute(f"ALTER TABLE videos ADD COLUMN {column_name} {column_definition}")
 
     def upsert_videos(self, videos: list[VideoRecord]) -> UpsertStats:
         stats = UpsertStats()
@@ -119,10 +140,14 @@ class NewsStorage:
                             transcript_error,
                             transcript_text,
                             transcript_segments_json,
+                            ai_summary_points_json,
+                            ai_summary_model,
+                            ai_summary_generated_at,
+                            ai_summary_error,
                             raw_payload_json,
                             collected_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             record["video_id"],
@@ -146,6 +171,10 @@ class NewsStorage:
                             record["transcript_error"],
                             record["transcript_text"],
                             json.dumps(record["transcript_segments"], ensure_ascii=True),
+                            json.dumps(record["ai_summary_points"], ensure_ascii=True),
+                            record["ai_summary_model"],
+                            record["ai_summary_generated_at"],
+                            record["ai_summary_error"],
                             json.dumps(record["raw_payload"], ensure_ascii=True),
                             record["collected_at"],
                         ),
@@ -181,6 +210,10 @@ class NewsStorage:
                         transcript_error = ?,
                         transcript_text = ?,
                         transcript_segments_json = ?,
+                        ai_summary_points_json = ?,
+                        ai_summary_model = ?,
+                        ai_summary_generated_at = ?,
+                        ai_summary_error = ?,
                         raw_payload_json = ?,
                         collected_at = ?,
                         updated_at = CURRENT_TIMESTAMP
@@ -207,6 +240,10 @@ class NewsStorage:
                         merged["transcript_error"],
                         merged["transcript_text"],
                         json.dumps(merged["transcript_segments"], ensure_ascii=True),
+                        json.dumps(merged["ai_summary_points"], ensure_ascii=True),
+                        merged["ai_summary_model"],
+                        merged["ai_summary_generated_at"],
+                        merged["ai_summary_error"],
                         json.dumps(merged["raw_payload"], ensure_ascii=True),
                         merged["collected_at"],
                         existing["id"],
@@ -219,6 +256,9 @@ class NewsStorage:
         existing_payload = json.loads(existing["raw_payload_json"]) if existing["raw_payload_json"] else {}
         existing_segments = (
             json.loads(existing["transcript_segments_json"]) if existing["transcript_segments_json"] else []
+        )
+        existing_ai_summary_points = (
+            json.loads(existing["ai_summary_points_json"]) if existing["ai_summary_points_json"] else []
         )
 
         merged = {
@@ -242,6 +282,10 @@ class NewsStorage:
             "transcript_error": existing["transcript_error"],
             "transcript_text": existing["transcript_text"],
             "transcript_segments": existing_segments,
+            "ai_summary_points": existing_ai_summary_points,
+            "ai_summary_model": existing["ai_summary_model"],
+            "ai_summary_generated_at": existing["ai_summary_generated_at"],
+            "ai_summary_error": existing["ai_summary_error"],
             "raw_payload": incoming["raw_payload"] or existing_payload,
             "collected_at": incoming["collected_at"],
         }
@@ -256,6 +300,15 @@ class NewsStorage:
             merged["transcript_error"] = incoming["transcript_error"]
             merged["transcript_text"] = incoming["transcript_text"]
             merged["transcript_segments"] = incoming["transcript_segments"]
+            merged["ai_summary_points"] = incoming["ai_summary_points"]
+            merged["ai_summary_model"] = incoming["ai_summary_model"]
+            merged["ai_summary_generated_at"] = incoming["ai_summary_generated_at"]
+            merged["ai_summary_error"] = incoming["ai_summary_error"]
+        elif self._ai_summary_score(incoming) > self._ai_summary_score(existing):
+            merged["ai_summary_points"] = incoming["ai_summary_points"]
+            merged["ai_summary_model"] = incoming["ai_summary_model"]
+            merged["ai_summary_generated_at"] = incoming["ai_summary_generated_at"]
+            merged["ai_summary_error"] = incoming["ai_summary_error"]
 
         if (
             merged["channel_title"] == existing["channel_title"]
@@ -267,6 +320,10 @@ class NewsStorage:
             and merged["transcript_text"] == existing["transcript_text"]
             and merged["transcript_error"] == existing["transcript_error"]
             and merged["transcript_segments"] == existing_segments
+            and merged["ai_summary_points"] == existing_ai_summary_points
+            and merged["ai_summary_model"] == existing["ai_summary_model"]
+            and merged["ai_summary_generated_at"] == existing["ai_summary_generated_at"]
+            and merged["ai_summary_error"] == existing["ai_summary_error"]
             and merged["duration_seconds"] == existing["duration_seconds"]
         ):
             return None
@@ -278,6 +335,18 @@ class NewsStorage:
         has_text = 1 if transcript_text else 0
         status_rank = 2 if status == "ok" else 1 if status == "empty" else 0
         return (status_rank, len(transcript_text) if has_text else 0)
+
+    def _ai_summary_score(self, record: dict[str, Any] | sqlite3.Row) -> tuple[int, int, int]:
+        summary_points = self._summary_points_from_record(record)
+        summary_error = str(record["ai_summary_error"] or "")
+        joined_length = sum(len(item) for item in summary_points)
+        return (1 if summary_points else 0, 1 if summary_error else 0, joined_length)
+
+    def _summary_points_from_record(self, record: dict[str, Any] | sqlite3.Row) -> list[str]:
+        if isinstance(record, sqlite3.Row):
+            raw_value = record["ai_summary_points_json"] if "ai_summary_points_json" in record.keys() else "[]"
+            return list(json.loads(raw_value or "[]"))
+        return list(record.get("ai_summary_points", []) or [])
 
     def record_run(
         self,
@@ -352,6 +421,21 @@ class NewsStorage:
         ).fetchall()
         return [self._row_to_video_dict(row) for row in rows]
 
+    def fetch_videos_in_range(self, start_at: datetime, end_at: datetime) -> list[dict[str, Any]]:
+        start_utc = start_at.astimezone(timezone.utc).isoformat()
+        end_utc = end_at.astimezone(timezone.utc).isoformat()
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM videos
+            WHERE published_at >= ?
+              AND published_at < ?
+            ORDER BY published_at DESC
+            """,
+            (start_utc, end_utc),
+        ).fetchall()
+        return [self._row_to_video_dict(row) for row in rows]
+
     def fetch_videos_by_ids(self, video_ids: list[str]) -> list[dict[str, Any]]:
         normalized_ids = [str(video_id).strip() for video_id in video_ids if str(video_id).strip()]
         if not normalized_ids:
@@ -367,6 +451,34 @@ class NewsStorage:
             normalized_ids,
         ).fetchall()
         return [self._row_to_video_dict(row) for row in rows]
+
+    def clear_transcripts(self, video_ids: list[str]) -> int:
+        normalized_ids = [str(video_id).strip() for video_id in video_ids if str(video_id).strip()]
+        if not normalized_ids:
+            return 0
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with self.conn:
+            cursor = self.conn.execute(
+                f"""
+                UPDATE videos
+                SET transcript_status = 'pending',
+                    transcript_language = '',
+                    transcript_language_code = '',
+                    transcript_is_generated = 0,
+                    transcript_is_translated = 0,
+                    transcript_error = '',
+                    transcript_text = '',
+                    transcript_segments_json = '[]',
+                    ai_summary_points_json = '[]',
+                    ai_summary_model = '',
+                    ai_summary_generated_at = '',
+                    ai_summary_error = '',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE video_id IN ({placeholders})
+                """,
+                normalized_ids,
+            )
+        return int(cursor.rowcount or 0)
 
     def recent_runs(self, since_hours: int = 30) -> list[dict[str, Any]]:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).isoformat()
@@ -384,6 +496,7 @@ class NewsStorage:
     def _row_to_video_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         item["transcript_segments"] = json.loads(item.pop("transcript_segments_json"))
+        item["ai_summary_points"] = json.loads(item.pop("ai_summary_points_json"))
         item["raw_payload"] = json.loads(item.pop("raw_payload_json"))
         item["transcript_is_generated"] = bool(item["transcript_is_generated"])
         item["transcript_is_translated"] = bool(item["transcript_is_translated"])

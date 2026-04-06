@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import date
 
-from newstoday.reporting import build_summary_points, classify_topics, render_report
+from newstoday.reporting import build_summary_points, classify_topics, render_report, summary_points_for_video
 
 
 def sample_video(**overrides: object) -> dict:
@@ -46,6 +46,29 @@ class ReportingTests(unittest.TestCase):
         labels = classify_topics(sample_video()["transcript_text"])
         self.assertIn("Inflation & Rates", labels)
 
+    def test_summary_points_prefer_stored_ai_summary(self) -> None:
+        points = summary_points_for_video(
+            sample_video(
+                ai_summary_points=["Fed language and inflation data dominated the market outlook."],
+                ai_summary_model="gemini-2.5-flash",
+            )
+        )
+        self.assertEqual(points, ["Fed language and inflation data dominated the market outlook."])
+
+    def test_summary_points_for_video_no_longer_defaults_to_three_items(self) -> None:
+        points = summary_points_for_video(
+            sample_video(
+                ai_summary_points=[
+                    "Inflation remained elevated in the latest discussion.",
+                    "Central bank officials were weighing possible rate cuts.",
+                    "Hiring continued but wage growth slowed.",
+                    "Markets were watching the next CPI release.",
+                ],
+                ai_summary_model="gemini-2.5-flash",
+            )
+        )
+        self.assertEqual(len(points), 4)
+
     def test_render_report_includes_daily_video_news_section(self) -> None:
         markdown = render_report(
             videos=[sample_video()],
@@ -56,7 +79,20 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("## Daily Video News", markdown)
         self.assertIn("Inflation and jobs top the market agenda", markdown)
 
+    def test_render_report_uses_ai_summary_when_present(self) -> None:
+        markdown = render_report(
+            videos=[
+                sample_video(
+                    ai_summary_points=["Markets focused on inflation, rate cuts, and the next CPI print."],
+                    ai_summary_model="gemini-2.5-flash",
+                )
+            ],
+            runs=[],
+            report_date=date(2026, 4, 5),
+            timezone_name="UTC",
+        )
+        self.assertIn("Markets focused on inflation, rate cuts, and the next CPI print.", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()
-

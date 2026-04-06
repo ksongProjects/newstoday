@@ -107,6 +107,10 @@ class VideoRecord:
     transcript_error: str = ""
     transcript_text: str = ""
     transcript_segments: list[dict[str, Any]] = field(default_factory=list)
+    ai_summary_points: list[str] = field(default_factory=list)
+    ai_summary_model: str = ""
+    ai_summary_generated_at: str = ""
+    ai_summary_error: str = ""
     raw_payload: dict[str, Any] = field(default_factory=dict)
     collected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -136,6 +140,10 @@ class VideoRecord:
             "transcript_error": normalize_text(self.transcript_error),
             "transcript_text": normalize_text(self.transcript_text),
             "transcript_segments": self.transcript_segments,
+            "ai_summary_points": [normalize_text(item) for item in self.ai_summary_points if normalize_text(item)],
+            "ai_summary_model": normalize_text(self.ai_summary_model),
+            "ai_summary_generated_at": normalize_text(self.ai_summary_generated_at),
+            "ai_summary_error": normalize_text(self.ai_summary_error),
             "raw_payload": self.raw_payload,
             "collected_at": ensure_utc(self.collected_at).isoformat(),
         }
@@ -163,6 +171,10 @@ def video_record_from_mapping(data: Mapping[str, Any]) -> VideoRecord:
         transcript_error=str(data.get("transcript_error", "")),
         transcript_text=str(data.get("transcript_text", "")),
         transcript_segments=list(data.get("transcript_segments", []) or []),
+        ai_summary_points=list(data.get("ai_summary_points", []) or []),
+        ai_summary_model=str(data.get("ai_summary_model", "")),
+        ai_summary_generated_at=str(data.get("ai_summary_generated_at", "")),
+        ai_summary_error=str(data.get("ai_summary_error", "")),
         raw_payload=dict(data.get("raw_payload", {}) or {}),
         collected_at=parse_published_at(str(data.get("collected_at", ""))) if data.get("collected_at") else datetime.now(timezone.utc),
     )
