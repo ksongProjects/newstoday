@@ -1,47 +1,59 @@
-"""News source collectors."""
+"""YouTube channel collection and transcript fetching."""
 
 from __future__ import annotations
 
 import json
-import os
 import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
-from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from pathlib import Path
+from typing import Any, Iterable
 
-from .defaults import API_SEARCHES, GDELT_SEARCHES, GOOGLE_NEWS_SEARCHES
-from .models import Article, parse_published_at, strip_html
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    CouldNotRetrieveTranscript,
+    InvalidVideoId,
+    IpBlocked,
+    NoTranscriptFound,
+    PoTokenRequired,
+    RequestBlocked,
+    TranscriptsDisabled,
+    TranslationLanguageNotAvailable,
+    VideoUnavailable,
+    YouTubeTranscriptApiException,
+)
 
-USER_AGENT = "NewsToday/0.1 (+https://example.invalid)"
+from .defaults import DEFAULT_CHANNELS, DEFAULT_TRANSCRIPT_LANGUAGES
+from .models import (
+    ChannelTarget,
+    VideoRecord,
+    normalize_text,
+    parse_duration_seconds,
+    parse_published_at,
+)
+
+USER_AGENT = "NewsToday/0.2 (+https://example.invalid)"
 
 
 class SourceError(RuntimeError):
     """Raised when a source request fails."""
 
 
-class Collector(ABC):
-    name: str
+class YouTubeDataClient:
+    base_url = "https://www.googleapis.com/youtube/v3"
 
-    def __init__(self, *, max_per_query: int = 100) -> None:
-        self.max_per_query = max_per_query
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key.strip()
+        if not self.api_key:
+            raise SourceError("YOUTUBE_API_KEY is required for YouTube collection.")
 
-    @abstractmethod
-    def collect(self, *, hours: int) -> list[Article]:
-        raise NotImplementedError
-
-    def _json_get(
-        self,
-        url: str,
-        *,
-        headers: dict[str, str] | None = None,
-        timeout: int = 30,
-        attempts: int = 3,
-    ) -> dict:
+    def _get(self, endpoint: str, params: dict[str, str], *, timeout: int = 30, attempts: int = 2) -> dict:
+        query = dict(params)
+        query["key"] = self.api_key
+        url = f"{self.base_url}/{endpoint}?{urllib.parse.urlencode(query)}"
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             request = urllib.request.Request(
@@ -49,7 +61,6 @@ class Collector(ABC):
                 headers={
                     "User-Agent": USER_AGENT,
                     "Accept": "application/json",
-                    **(headers or {}),
                 },
             )
             try:
@@ -60,342 +71,538 @@ class Collector(ABC):
                 if attempt == attempts:
                     break
                 time.sleep(min(2 ** (attempt - 1), 4))
-        raise SourceError(f"{self.name}: request failed for {url}: {last_exc}") from last_exc
+        raise SourceError(f"YouTube API request failed for {endpoint}: {last_exc}") from last_exc
 
-    def _text_get(
-        self,
-        url: str,
-        *,
-        headers: dict[str, str] | None = None,
-        timeout: int = 30,
-        attempts: int = 3,
-    ) -> str:
-        last_exc: Exception | None = None
-        for attempt in range(1, attempts + 1):
-            request = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "application/rss+xml, application/xml, text/xml, text/plain;q=0.9, */*;q=0.8",
-                    **(headers or {}),
-                },
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    return response.read().decode("utf-8", errors="replace")
-            except (urllib.error.HTTPError, urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-                last_exc = exc
-                if attempt == attempts:
-                    break
-                time.sleep(min(2 ** (attempt - 1), 4))
-        raise SourceError(f"{self.name}: request failed for {url}: {last_exc}") from last_exc
-
-
-class GoogleNewsRSSCollector(Collector):
-    name = "google_news_rss"
-
-    def collect(self, *, hours: int) -> list[Article]:
-        window = f"{hours}h" if hours < 24 else f"{max(1, hours // 24)}d"
-        articles: list[Article] = []
-        for query in GOOGLE_NEWS_SEARCHES:
-            search = f"({query}) when:{window}"
-            params = urllib.parse.urlencode(
-                {"q": search, "hl": "en-US", "gl": "US", "ceid": "US:en"}
-            )
-            url = f"https://news.google.com/rss/search?{params}"
-            xml_text = self._text_get(url, timeout=25)
-            root = ET.fromstring(xml_text)
-            for item in root.findall("./channel/item")[: self.max_per_query]:
-                source_element = item.find("source")
-                source_name = (source_element.text or "Google News").strip() if source_element is not None else "Google News"
-                source_url = source_element.attrib.get("url", "") if source_element is not None else ""
-                title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
-                description = strip_html(item.findtext("description"))
-                if source_name and description.endswith(source_name):
-                    description = description[: -len(source_name)].rstrip(" -|")
-                articles.append(
-                    Article(
-                        source_type="rss",
-                        source_name=source_name,
-                        title=title,
-                        url=link,
-                        published_at=parse_published_at(item.findtext("pubDate")),
-                        description=description,
-                        language="en",
-                        query=query,
-                        raw_payload={
-                            "source_url": source_url,
-                            "guid": item.findtext("guid", ""),
-                        },
+    def resolve_channel(self, target: ChannelTarget) -> dict[str, Any]:
+        if target.channel_id:
+            payload = self._get("channels", {"part": "snippet,contentDetails,statistics", "id": target.channel_id})
+            items = payload.get("items", [])
+            if items:
+                return items[0]
+        if target.username:
+            payload = self._get("channels", {"part": "snippet,contentDetails,statistics", "forUsername": target.username})
+            items = payload.get("items", [])
+            if items:
+                return items[0]
+        if target.handle:
+            for handle_value in (target.handle, target.handle.lstrip("@")):
+                try:
+                    payload = self._get(
+                        "channels",
+                        {"part": "snippet,contentDetails,statistics", "forHandle": handle_value},
+                        timeout=15,
+                        attempts=1,
                     )
-                )
-            time.sleep(0.2)
-        return articles
+                except SourceError:
+                    payload = {}
+                items = payload.get("items", [])
+                if items:
+                    return items[0]
+            resolved = self._resolve_channel_with_search(target)
+            if resolved:
+                return resolved
+        raise SourceError(f"Unable to resolve YouTube channel target: {target.display_name()}")
 
-
-class GDELTCollector(Collector):
-    name = "gdelt"
-
-    def collect(self, *, hours: int) -> list[Article]:
-        articles: list[Article] = []
-        timespan = f"{hours}h" if hours < 24 else f"{max(1, hours // 24)}d"
-        per_query = min(self.max_per_query, 50)
-        failures: list[str] = []
-        for query in GDELT_SEARCHES:
-            params = urllib.parse.urlencode(
+    def _resolve_channel_with_search(self, target: ChannelTarget) -> dict[str, Any] | None:
+        queries = [value for value in [target.handle, target.handle.lstrip("@"), target.label] if value]
+        fallback: dict[str, Any] | None = None
+        for query in queries:
+            payload = self._get(
+                "search",
                 {
-                    "query": query,
-                    "mode": "artlist",
-                    "maxrecords": str(per_query),
-                    "format": "json",
-                    "sort": "datedesc",
-                    "timespan": timespan,
+                    "part": "snippet",
+                    "type": "channel",
+                    "q": query,
+                    "maxResults": "5",
+                },
+                timeout=15,
+                attempts=1,
+            )
+            for item in payload.get("items", []):
+                channel_id = (
+                    item.get("id", {}).get("channelId")
+                    or item.get("snippet", {}).get("channelId")
+                    or ""
+                )
+                if not channel_id:
+                    continue
+                candidate = self._get("channels", {"part": "snippet,contentDetails,statistics", "id": channel_id})
+                candidate_items = candidate.get("items", [])
+                if not candidate_items:
+                    continue
+                channel = candidate_items[0]
+                if self._channel_matches_target(channel, target):
+                    return channel
+                if fallback is None:
+                    fallback = channel
+        return fallback
+
+    def _channel_matches_target(self, channel: dict[str, Any], target: ChannelTarget) -> bool:
+        snippet = channel.get("snippet", {})
+        title = normalize_text(snippet.get("title")).lower()
+        custom_url = normalize_text(snippet.get("customUrl")).lower().lstrip("@")
+        handle = target.handle.lower().lstrip("@")
+        if target.channel_id and channel.get("id", "").lower() == target.channel_id.lower():
+            return True
+        if handle and custom_url and handle == custom_url:
+            return True
+        if target.label and title == target.label.lower():
+            return True
+        return False
+
+    def fetch_recent_uploads(
+        self,
+        *,
+        uploads_playlist_id: str,
+        cutoff: datetime,
+        max_videos: int,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        page_token = ""
+        stop_paging = False
+        while len(items) < max_videos and not stop_paging:
+            params = {
+                "part": "snippet,contentDetails",
+                "playlistId": uploads_playlist_id,
+                "maxResults": str(min(50, max_videos)),
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            payload = self._get("playlistItems", params, timeout=20, attempts=2)
+            for item in payload.get("items", []):
+                content_details = item.get("contentDetails", {})
+                video_id = content_details.get("videoId") or ""
+                if not video_id or video_id in seen_ids:
+                    continue
+                published_raw = content_details.get("videoPublishedAt") or item.get("snippet", {}).get("publishedAt")
+                published_at = parse_published_at(published_raw)
+                if published_at < cutoff:
+                    stop_paging = True
+                    break
+                items.append(item)
+                seen_ids.add(video_id)
+                if len(items) >= max_videos:
+                    break
+            page_token = payload.get("nextPageToken", "")
+            if not page_token:
+                break
+            time.sleep(0.1)
+        return items
+
+    def fetch_video_details(self, video_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        ids = [video_id for video_id in video_ids if video_id]
+        results: dict[str, dict[str, Any]] = {}
+        for index in range(0, len(ids), 50):
+            chunk = ids[index : index + 50]
+            payload = self._get(
+                "videos",
+                {
+                    "part": "snippet,contentDetails,statistics,status,liveStreamingDetails",
+                    "id": ",".join(chunk),
+                },
+                timeout=20,
+                attempts=2,
+            )
+            for item in payload.get("items", []):
+                if item.get("id"):
+                    results[item["id"]] = item
+            time.sleep(0.1)
+        return results
+
+    def search_channels(
+        self,
+        *,
+        query: str,
+        max_results: int = 10,
+        page_token: str = "",
+    ) -> dict[str, Any]:
+        params = {
+            "part": "snippet",
+            "type": "channel",
+            "q": query,
+            "maxResults": str(min(max(max_results, 1), 25)),
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        payload = self._get("search", params, timeout=20, attempts=2)
+        channel_ids = [
+            item.get("id", {}).get("channelId", "")
+            for item in payload.get("items", [])
+            if item.get("id", {}).get("channelId", "")
+        ]
+        details_map: dict[str, dict[str, Any]] = {}
+        if channel_ids:
+            details_payload = self._get(
+                "channels",
+                {
+                    "part": "snippet,statistics,contentDetails",
+                    "id": ",".join(channel_ids),
+                },
+                timeout=20,
+                attempts=2,
+            )
+            details_map = {
+                item.get("id", ""): item
+                for item in details_payload.get("items", [])
+                if item.get("id")
+            }
+        results = []
+        for item in payload.get("items", []):
+            channel_id = item.get("id", {}).get("channelId", "")
+            detail = details_map.get(channel_id, {})
+            snippet = detail.get("snippet", {}) or item.get("snippet", {})
+            results.append(
+                {
+                    "channel_id": channel_id,
+                    "title": normalize_text(snippet.get("title")),
+                    "handle": "@" + normalize_text(snippet.get("customUrl", "")).lstrip("@")
+                    if normalize_text(snippet.get("customUrl"))
+                    else "",
+                    "description": normalize_text(snippet.get("description")),
+                    "thumbnail_url": (
+                        snippet.get("thumbnails", {}).get("default", {}).get("url", "")
+                    ),
+                    "video_count": int(detail.get("statistics", {}).get("videoCount", 0) or 0),
+                    "subscriber_count": int(detail.get("statistics", {}).get("subscriberCount", 0) or 0),
                 }
             )
-            url = f"http://api.gdeltproject.org/api/v2/doc/doc?{params}"
+        return {
+            "results": results,
+            "next_page_token": payload.get("nextPageToken", ""),
+            "prev_page_token": payload.get("prevPageToken", ""),
+        }
+
+
+class TranscriptFetcher:
+    def __init__(self, languages: Iterable[str]) -> None:
+        cleaned = [language.strip() for language in languages if language and language.strip()]
+        self.languages = tuple(cleaned or DEFAULT_TRANSCRIPT_LANGUAGES)
+        self.translation_target = self.languages[0].split("-", 1)[0]
+        self.api = YouTubeTranscriptApi()
+
+    def fetch(self, video_id: str) -> dict[str, Any]:
+        try:
+            transcript_list = self.api.list(video_id)
+            transcript = self._pick_transcript(transcript_list)
+            if transcript is None:
+                return self._missing_result("No transcript found.")
+            fetched = transcript.fetch(preserve_formatting=False)
+            raw_segments = fetched.to_raw_data()
+            text = normalize_text(" ".join(segment.get("text", "") for segment in raw_segments))
+            return {
+                "status": "ok" if text else "empty",
+                "language": fetched.language,
+                "language_code": fetched.language_code,
+                "is_generated": bool(fetched.is_generated),
+                "is_translated": bool(getattr(transcript, "_news_today_translated", False)),
+                "error": "",
+                "text": text,
+                "segments": raw_segments,
+            }
+        except NoTranscriptFound:
+            return self._missing_result("No transcript found.")
+        except TranscriptsDisabled:
+            return self._missing_result("Transcripts are disabled.", status="disabled")
+        except VideoUnavailable:
+            return self._missing_result("Video unavailable.", status="unavailable")
+        except InvalidVideoId:
+            return self._missing_result("Invalid video id.", status="invalid")
+        except (RequestBlocked, IpBlocked, PoTokenRequired) as exc:
+            return self._missing_result(str(exc), status="blocked")
+        except (CouldNotRetrieveTranscript, TranslationLanguageNotAvailable, YouTubeTranscriptApiException) as exc:
+            return self._missing_result(str(exc), status="error")
+
+    def _pick_transcript(self, transcript_list: Any) -> Any | None:
+        for finder_name in ("find_manually_created_transcript", "find_generated_transcript", "find_transcript"):
+            finder = getattr(transcript_list, finder_name)
             try:
-                payload = self._json_get(url, timeout=10, attempts=1)
+                transcript = finder(list(self.languages))
+                setattr(transcript, "_news_today_translated", False)
+                return transcript
+            except NoTranscriptFound:
+                continue
+
+        for transcript in transcript_list:
+            if not getattr(transcript, "is_translatable", False):
+                continue
+            try:
+                translated = transcript.translate(self.translation_target)
+                setattr(translated, "_news_today_translated", True)
+                return translated
+            except TranslationLanguageNotAvailable:
+                continue
+        return None
+
+    def _missing_result(self, error: str, *, status: str = "missing") -> dict[str, Any]:
+        return {
+            "status": status,
+            "language": "",
+            "language_code": "",
+            "is_generated": False,
+            "is_translated": False,
+            "error": normalize_text(error),
+            "text": "",
+            "segments": [],
+        }
+
+
+class YouTubeNewsCollector:
+    name = "youtube"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        channels_file: str | None = None,
+        targets: list[ChannelTarget] | None = None,
+        max_videos_per_channel: int = 10,
+        transcript_languages: Iterable[str] = DEFAULT_TRANSCRIPT_LANGUAGES,
+    ) -> None:
+        self.client = YouTubeDataClient(api_key)
+        self.transcripts = TranscriptFetcher(transcript_languages)
+        self.max_videos_per_channel = max(1, int(max_videos_per_channel))
+        self.targets = dedupe_channel_targets(targets or load_channel_targets(channels_file))
+
+    def collect(self, *, hours: int, selected_channels: list[str] | None = None) -> list[VideoRecord]:
+        videos = self.collect_metadata(hours=hours, selected_channels=selected_channels)
+        return self.enrich_transcripts(videos)
+
+    def collect_metadata(self, *, hours: int, selected_channels: list[str] | None = None) -> list[VideoRecord]:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        targets = select_channel_targets(self.targets, selected_channels)
+        videos: list[VideoRecord] = []
+        failures: list[str] = []
+
+        for target in targets:
+            try:
+                channel = self.client.resolve_channel(target)
+                uploads_playlist = (
+                    channel.get("contentDetails", {})
+                    .get("relatedPlaylists", {})
+                    .get("uploads", "")
+                )
+                if not uploads_playlist:
+                    raise SourceError(f"No uploads playlist found for {target.display_name()}.")
+                playlist_items = self.client.fetch_recent_uploads(
+                    uploads_playlist_id=uploads_playlist,
+                    cutoff=cutoff,
+                    max_videos=self.max_videos_per_channel,
+                )
+                details_map = self.client.fetch_video_details(
+                    item.get("contentDetails", {}).get("videoId", "") for item in playlist_items
+                )
+                for playlist_item in playlist_items:
+                    video_id = playlist_item.get("contentDetails", {}).get("videoId", "")
+                    details = details_map.get(video_id)
+                    if not details:
+                        continue
+                    record = self._build_video_record(
+                        target=target,
+                        channel=channel,
+                        playlist_item=playlist_item,
+                        details=details,
+                        fetch_transcript=False,
+                    )
+                    if record is not None:
+                        videos.append(record)
             except SourceError as exc:
                 failures.append(str(exc))
                 continue
-            for item in payload.get("articles", []):
-                articles.append(
-                    Article(
-                        source_type="api",
-                        source_name=item.get("domain") or "GDELT",
-                        title=item.get("title") or "",
-                        url=item.get("url") or item.get("url_mobile") or "",
-                        published_at=parse_published_at(item.get("seendate")),
-                        language=(item.get("language") or "").lower(),
-                        country=item.get("sourcecountry") or "",
-                        image_url=item.get("socialimage") or "",
-                        query=query,
-                        raw_payload=item,
-                    )
-                )
-            time.sleep(0.3)
-        if not articles and failures:
+
+        if not videos and failures:
             raise SourceError(failures[0])
-        return articles
+        return videos
 
-
-class GNewsCollector(Collector):
-    name = "gnews"
-
-    def __init__(self, api_key: str, *, max_per_query: int = 10) -> None:
-        super().__init__(max_per_query=max_per_query)
-        self.api_key = api_key
-
-    def collect(self, *, hours: int) -> list[Article]:
-        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-        articles: list[Article] = []
-        for query in API_SEARCHES:
-            params = urllib.parse.urlencode(
-                {
-                    "q": query,
-                    "lang": "en",
-                    "max": str(min(self.max_per_query, 10)),
-                    "from": since,
-                    "apikey": self.api_key,
-                }
-            )
-            url = f"https://gnews.io/api/v4/search?{params}"
-            payload = self._json_get(url)
-            for item in payload.get("articles", []):
-                source = item.get("source") or {}
-                articles.append(
-                    Article(
-                        source_type="api",
-                        source_name=source.get("name") or "GNews",
-                        title=item.get("title") or "",
-                        url=item.get("url") or "",
-                        published_at=parse_published_at(item.get("publishedAt")),
-                        description=item.get("description") or "",
-                        language="en",
-                        image_url=item.get("image") or "",
-                        content=item.get("content") or "",
-                        query=query,
-                        raw_payload=item,
-                    )
+    def enrich_transcripts(
+        self,
+        videos: Iterable[VideoRecord],
+        *,
+        selected_video_ids: list[str] | None = None,
+    ) -> list[VideoRecord]:
+        selected = {video_id.strip() for video_id in (selected_video_ids or []) if video_id and video_id.strip()}
+        enriched: list[VideoRecord] = []
+        for video in videos:
+            if selected and video.video_id not in selected:
+                enriched.append(video)
+                continue
+            transcript_result = self.transcripts.fetch(video.video_id)
+            enriched.append(
+                VideoRecord(
+                    video_id=video.video_id,
+                    channel_id=video.channel_id,
+                    channel_title=video.channel_title,
+                    channel_lookup=video.channel_lookup,
+                    title=video.title,
+                    description=video.description,
+                    published_at=video.published_at,
+                    duration_iso=video.duration_iso,
+                    duration_seconds=video.duration_seconds,
+                    view_count=video.view_count,
+                    thumbnail_url=video.thumbnail_url,
+                    live_status=video.live_status,
+                    transcript_status=transcript_result["status"],
+                    transcript_language=transcript_result["language"],
+                    transcript_language_code=transcript_result["language_code"],
+                    transcript_is_generated=bool(transcript_result["is_generated"]),
+                    transcript_is_translated=bool(transcript_result["is_translated"]),
+                    transcript_error=transcript_result["error"],
+                    transcript_text=transcript_result["text"],
+                    transcript_segments=transcript_result["segments"],
+                    raw_payload=video.raw_payload,
+                    collected_at=datetime.now(timezone.utc),
                 )
-            time.sleep(0.25)
-        return articles
-
-
-class NewsDataCollector(Collector):
-    name = "newsdata"
-
-    def __init__(self, api_key: str, *, max_per_query: int = 30) -> None:
-        super().__init__(max_per_query=max_per_query)
-        self.api_key = api_key
-
-    def collect(self, *, hours: int) -> list[Article]:
-        articles: list[Article] = []
-        max_pages = max(1, self.max_per_query // 10)
-        for query in API_SEARCHES:
-            next_page = ""
-            for _ in range(max_pages):
-                params = {
-                    "apikey": self.api_key,
-                    "q": query,
-                    "language": "en",
-                    "category": "business",
-                }
-                if next_page:
-                    params["page"] = next_page
-                url = f"https://newsdata.io/api/1/latest?{urllib.parse.urlencode(params)}"
-                payload = self._json_get(url)
-                for item in payload.get("results", []):
-                    creator = item.get("creator")
-                    authors = creator if isinstance(creator, list) else ([creator] if creator else [])
-                    country = item.get("country")
-                    if isinstance(country, list):
-                        country = ",".join(country)
-                    categories = item.get("category") or []
-                    articles.append(
-                        Article(
-                            source_type="api",
-                            source_name=item.get("source_name") or "NewsData.io",
-                            title=item.get("title") or "",
-                            url=item.get("link") or "",
-                            published_at=parse_published_at(item.get("pubDate")),
-                            description=strip_html(item.get("description")),
-                            language=item.get("language") or "en",
-                            country=country or "",
-                            categories=categories,
-                            authors=authors,
-                            image_url=item.get("image_url") or "",
-                            content=item.get("content") or "",
-                            external_id=item.get("article_id") or "",
-                            query=query,
-                            raw_payload=item,
-                        )
-                    )
-                next_page = payload.get("nextPage") or ""
-                if not next_page:
-                    break
-                time.sleep(0.25)
-        return self._filter_recent(articles, hours)
-
-    def _filter_recent(self, articles: Iterable[Article], hours: int) -> list[Article]:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-        return [article for article in articles if article.normalized_published_at() >= cutoff]
-
-
-class CurrentsCollector(Collector):
-    name = "currents"
-
-    def __init__(self, api_key: str, *, max_per_query: int = 80) -> None:
-        super().__init__(max_per_query=max_per_query)
-        self.api_key = api_key
-
-    def collect(self, *, hours: int) -> list[Article]:
-        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        articles: list[Article] = []
-        page_size = min(self.max_per_query, 50)
-        for query in API_SEARCHES:
-            params = urllib.parse.urlencode(
-                {
-                    "keywords": query,
-                    "language": "en",
-                    "start_date": since,
-                    "page_size": str(page_size),
-                    "category": "finance",
-                }
             )
-            url = f"https://api.currentsapi.services/v1/search?{params}"
-            payload = self._json_get(url, headers={"Authorization": self.api_key})
-            for item in payload.get("news", []):
-                categories = item.get("category")
-                if isinstance(categories, str):
-                    categories = [categories]
-                articles.append(
-                    Article(
-                        source_type="api",
-                        source_name=item.get("author") or item.get("id") or "Currents",
-                        title=item.get("title") or "",
-                        url=item.get("url") or "",
-                        published_at=parse_published_at(item.get("published")),
-                        description=strip_html(item.get("description")),
-                        language=item.get("language") or "en",
-                        country=item.get("country") or "",
-                        categories=categories or [],
-                        image_url=item.get("image") or "",
-                        content=item.get("description") or "",
-                        external_id=item.get("id") or "",
-                        query=query,
-                        raw_payload=item,
-                    )
-                )
-            time.sleep(0.25)
-        return articles
+        return enriched
 
+    def _build_video_record(
+        self,
+        *,
+        target: ChannelTarget,
+        channel: dict[str, Any],
+        playlist_item: dict[str, Any],
+        details: dict[str, Any],
+        fetch_transcript: bool,
+    ) -> VideoRecord | None:
+        snippet = details.get("snippet", {})
+        status = details.get("status", {})
+        content_details = details.get("contentDetails", {})
+        live_status = normalize_text(snippet.get("liveBroadcastContent") or "none").lower() or "none"
+        if live_status in {"live", "upcoming"}:
+            return None
+        if normalize_text(status.get("privacyStatus")).lower() not in {"", "public"}:
+            return None
 
-class AlphaVantageCollector(Collector):
-    name = "alphavantage"
-
-    def __init__(self, api_key: str, *, max_per_query: int = 1000) -> None:
-        super().__init__(max_per_query=max_per_query)
-        self.api_key = api_key
-
-    def collect(self, *, hours: int) -> list[Article]:
-        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y%m%dT%H%M")
-        params = urllib.parse.urlencode(
-            {
-                "function": "NEWS_SENTIMENT",
-                "topics": "economy_macro,economy_monetary,economy_fiscal,financial_markets,finance,energy_transportation",
-                "time_from": since,
-                "sort": "LATEST",
-                "limit": str(min(self.max_per_query, 1000)),
-                "apikey": self.api_key,
+        transcript_result = (
+            self.transcripts.fetch(details.get("id", ""))
+            if fetch_transcript
+            else {
+                "status": "pending",
+                "language": "",
+                "language_code": "",
+                "is_generated": False,
+                "is_translated": False,
+                "error": "",
+                "text": "",
+                "segments": [],
             }
         )
-        url = f"https://www.alphavantage.co/query?{params}"
-        payload = self._json_get(url)
-        feed = payload.get("feed", [])
-        articles: list[Article] = []
-        for item in feed:
-            source = item.get("source") or "Alpha Vantage"
-            topics = [topic.get("topic", "") for topic in item.get("topics", []) if topic.get("topic")]
-            authors = item.get("authors") or []
-            articles.append(
-                Article(
-                    source_type="api",
-                    source_name=source,
-                    title=item.get("title") or "",
-                    url=item.get("url") or "",
-                    published_at=parse_published_at(item.get("time_published")),
-                    description=item.get("summary") or "",
-                    language="en",
-                    categories=topics,
-                    authors=authors,
-                    image_url=item.get("banner_image") or "",
-                    content=item.get("summary") or "",
-                    external_id=item.get("overall_sentiment_label") or "",
-                    query="economy topics",
-                    raw_payload=item,
+        thumbnails = snippet.get("thumbnails", {})
+        thumbnail_url = (
+            thumbnails.get("maxres", {}).get("url")
+            or thumbnails.get("high", {}).get("url")
+            or thumbnails.get("medium", {}).get("url")
+            or thumbnails.get("default", {}).get("url")
+            or ""
+        )
+
+        return VideoRecord(
+            video_id=details.get("id", ""),
+            channel_id=channel.get("id", ""),
+            channel_title=snippet.get("channelTitle") or channel.get("snippet", {}).get("title", ""),
+            channel_lookup=target.key(),
+            title=snippet.get("title", ""),
+            description=snippet.get("description", ""),
+            published_at=parse_published_at(snippet.get("publishedAt")),
+            duration_iso=content_details.get("duration", ""),
+            duration_seconds=parse_duration_seconds(content_details.get("duration")),
+            view_count=int(details.get("statistics", {}).get("viewCount", 0) or 0),
+            thumbnail_url=thumbnail_url,
+            live_status=live_status,
+            transcript_status=transcript_result["status"],
+            transcript_language=transcript_result["language"],
+            transcript_language_code=transcript_result["language_code"],
+            transcript_is_generated=bool(transcript_result["is_generated"]),
+            transcript_is_translated=bool(transcript_result["is_translated"]),
+            transcript_error=transcript_result["error"],
+            transcript_text=transcript_result["text"],
+            transcript_segments=transcript_result["segments"],
+            raw_payload={
+                "target": {
+                    "label": target.label,
+                    "handle": target.handle,
+                    "channel_id": target.channel_id,
+                    "username": target.username,
+                },
+                "channel": channel,
+                "playlist_item": playlist_item,
+                "video": details,
+            },
+        )
+
+
+def load_channel_targets(channels_file: str | None) -> list[ChannelTarget]:
+    if not channels_file:
+        return [ChannelTarget(**item) for item in DEFAULT_CHANNELS]
+
+    path = Path(channels_file)
+    if not path.exists():
+        raise SourceError(f"Channels file not found: {path}")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise SourceError("Channels file must contain a JSON list.")
+
+    targets: list[ChannelTarget] = []
+    for item in payload:
+        if isinstance(item, str):
+            targets.append(channel_target_from_value(item))
+            continue
+        if isinstance(item, dict):
+            targets.append(
+                ChannelTarget(
+                    label=normalize_text(item.get("label")),
+                    handle=normalize_text(item.get("handle")),
+                    channel_id=normalize_text(item.get("channel_id")),
+                    username=normalize_text(item.get("username")),
                 )
             )
-        return articles
+            continue
+        raise SourceError("Each channel entry must be a string or object.")
+    return dedupe_channel_targets(targets)
 
 
-def enabled_collectors(*, max_per_query: int = 100) -> list[Collector]:
-    collectors: list[Collector] = [
-        GoogleNewsRSSCollector(max_per_query=max_per_query),
-        GDELTCollector(max_per_query=max_per_query),
-    ]
-    gnews_key = os.getenv("GNEWS_API_KEY", "").strip()
-    newsdata_key = os.getenv("NEWSDATA_API_KEY", "").strip()
-    currents_key = os.getenv("CURRENTS_API_KEY", "").strip()
-    alphavantage_key = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+def dedupe_channel_targets(targets: Iterable[ChannelTarget]) -> list[ChannelTarget]:
+    deduped: list[ChannelTarget] = []
+    seen: set[str] = set()
+    for target in targets:
+        key = target.key().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(target)
+    return deduped
 
-    if gnews_key:
-        collectors.append(GNewsCollector(gnews_key, max_per_query=min(max_per_query, 10)))
-    if newsdata_key:
-        collectors.append(NewsDataCollector(newsdata_key, max_per_query=max_per_query))
-    if currents_key:
-        collectors.append(CurrentsCollector(currents_key, max_per_query=max_per_query))
-    if alphavantage_key:
-        collectors.append(AlphaVantageCollector(alphavantage_key, max_per_query=max_per_query))
-    return collectors
+
+def select_channel_targets(targets: list[ChannelTarget], selected_channels: list[str] | None) -> list[ChannelTarget]:
+    if not selected_channels:
+        return targets
+
+    chosen: list[ChannelTarget] = []
+    remaining = [value for value in selected_channels if value and value.strip()]
+    for target in targets:
+        for raw_value in list(remaining):
+            if target.matches(raw_value):
+                chosen.append(target)
+                remaining.remove(raw_value)
+                break
+
+    for raw_value in remaining:
+        chosen.append(channel_target_from_value(raw_value))
+    return dedupe_channel_targets(chosen)
+
+
+def channel_target_from_value(value: str) -> ChannelTarget:
+    raw = value.strip()
+    lowered = raw.lower()
+    if "/channel/" in lowered:
+        channel_id = raw.split("/channel/", 1)[1].split("/", 1)[0]
+        return ChannelTarget(channel_id=channel_id)
+    if "/@" in raw:
+        handle = "@" + raw.split("/@", 1)[1].split("/", 1)[0]
+        return ChannelTarget(handle=handle)
+    if raw.startswith("@"):
+        return ChannelTarget(handle=raw)
+    if raw.startswith("UC"):
+        return ChannelTarget(channel_id=raw)
+    return ChannelTarget(label=raw)

@@ -1,0 +1,22 @@
+[
+  {
+    "label": "Bloomberg Television",
+    "handle": "@BloombergTelevision"
+  },
+  {
+    "label": "CNBC Television",
+    "handle": "@CNBCTelevision"
+  },
+  {
+    "label": "Reuters",
+    "handle": "@Reuters"
+  },
+  {
+    "label": "Yahoo Finance",
+    "handle": "@YahooFinance"
+  },
+  {
+    "label": "Financial Times",
+    "handle": "@FinancialTimes"
+  }
+]

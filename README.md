@@ -1,20 +1,43 @@
 # NewsToday
 
-NewsToday is a lightweight Python collector for economic world news. It is built to pull from zero-cost sources by default and layer in additional free-tier APIs when you add API keys.
+NewsToday is a YouTube-first headline news collector. It monitors curated news channels, pulls recent uploads with the YouTube Data API, fetches transcripts with `youtube-transcript-api`, stores the results in SQLite, and generates a daily Markdown report centered on transcript-backed summaries.
 
-Out of the box it collects from:
+It also includes a dense dark Streamlit UI for:
 
-- Google News RSS query feeds
-- GDELT DOC 2.0 article search on a best-effort basis
+- entering the YouTube API key for the current session
+- searching YouTube channels and adding them directly to the watchlist
+- editing, enabling, and removing channels directly in the UI
+- loading recent uploads without immediately transcribing everything
+- selecting only the videos you want to transcribe
+- reviewing summaries and full transcripts in-app
+- exporting selected or filtered transcript results as JSON or CSV
 
-Optional free-tier adapters are included for:
+## What It Does
 
-- GNews
-- NewsData.io
-- Currents
-- Alpha Vantage News & Sentiment
+- Collects recent uploads from known YouTube news channels
+- Fetches video metadata like title, publish time, duration, and view count
+- Pulls transcripts when captions are available
+- Builds transcript-based summary bullets for headline videos
+- Generates a daily report with a dedicated video-news section, topic watch, and transcript gap tracking
 
-The collector stores normalized articles in SQLite, deduplicates them across sources and queries, and generates a daily Markdown report with headline coverage, topic buckets, trending terms, and source mix.
+## Requirements
+
+- Python 3.10+
+- A YouTube Data API key in `YOUTUBE_API_KEY`
+
+Install dependencies:
+
+```powershell
+pip install -e .
+```
+
+## Launch The UI
+
+```powershell
+python -m streamlit run newstoday/ui.py
+```
+
+The UI is intentionally dark, compact, and data-dense so you can keep more channels, videos, and transcript detail on screen at once.
 
 ## Quick Start
 
@@ -24,80 +47,79 @@ python -m newstoday.cli report
 python -m newstoday.cli daily
 ```
 
-To use optional keyed providers, set environment variables from `.env.example` first.
+### Example
 
-## What Gets Built
+```powershell
+$env:YOUTUBE_API_KEY="your-key"
+python -m newstoday.cli daily --hours 24 --timezone America/Vancouver
+```
 
-- `data/news.db`: SQLite database with articles and collection runs
-- `reports/daily-news-YYYY-MM-DD.md`: daily report in Markdown
+## Channel Configuration
+
+The Streamlit UI manages the watchlist directly in session state, so you can search YouTube and add or remove channels without creating a channels file.
+
+If you do not provide a channels file to the CLI, NewsToday uses a small built-in starter list of business and world-news channels.
+
+If you want explicit channel control for CLI runs, copy `channels.example.json` to `channels.json`, edit it, and point `NEWSTODAY_CHANNELS_FILE` at it or pass `--channels-file channels.json`.
+
+Each entry can be:
+
+- A handle string like `"@Reuters"`
+- A channel id like `"UC..."` 
+- An object such as `{"label": "Reuters", "handle": "@Reuters"}`
 
 ## CLI
 
 ```powershell
-python -m newstoday.cli collect --hours 24
+python -m newstoday.cli collect --hours 24 --max-videos-per-channel 12
+python -m newstoday.cli collect --channel @Reuters --channel @BloombergTelevision
 python -m newstoday.cli report --date 2026-04-05
-python -m newstoday.cli daily --hours 24
-python -m newstoday.cli collect --source google_news_rss --source gdelt
+python -m newstoday.cli daily --channels-file channels.json
 ```
 
 ### Commands
 
-- `collect`: pull articles from enabled sources into SQLite
-- `report`: build a report from articles already stored in SQLite
-- `daily`: run `collect` and then `report`
+- `collect`: poll channels, fetch transcripts, and upsert videos into SQLite
+- `report`: generate a Markdown report from stored videos
+- `daily`: run collection and then generate the report
 
 ### Useful Options
 
 - `--db`: override SQLite path
 - `--report-dir`: override output directory
 - `--hours`: lookback window for collection
-- `--date`: target report date in `YYYY-MM-DD`
-- `--timezone`: report timezone, defaults to `NEWSTODAY_TIMEZONE` or `UTC`
-- `--source`: limit collection to one or more named sources
+- `--channel`: limit collection to specific handles, labels, or channel IDs
+- `--channels-file`: JSON file with curated channels
+- `--max-videos-per-channel`: cap uploads per channel per run
+- `--transcript-language`: set transcript language priority order
 
-## Source Strategy
+## Output
 
-The default profile is designed to maximize coverage while staying free:
+- `data/news.db`: SQLite database with videos and collection runs
+- `reports/daily-video-news-YYYY-MM-DD.md`: daily YouTube news report
 
-1. Google News RSS search feeds fan out across multiple economic search queries and return up to 100 items per feed.
-2. GDELT adds broad international article coverage across many publishers and languages.
-3. Optional keyed sources add more JSON-native feeds and larger daily quotas if you want extra volume.
+## Report Structure
 
-Because the same story can appear through multiple searches and providers, NewsToday deduplicates articles using canonical URLs plus title and source fingerprints.
+The daily report includes:
 
-## Environment Variables
-
-```text
-NEWSTODAY_DB_PATH
-NEWSTODAY_REPORT_DIR
-NEWSTODAY_TIMEZONE
-NEWSTODAY_DEFAULT_HOURS
-GNEWS_API_KEY
-NEWSDATA_API_KEY
-CURRENTS_API_KEY
-ALPHAVANTAGE_API_KEY
-```
-
-## Scheduling
-
-On Windows Task Scheduler, you can run a daily job such as:
-
-```powershell
-python -m newstoday.cli daily --hours 24
-```
+- Collector status
+- Daily video news
+- Topic watch
+- Transcript coverage
+- Transcript gaps
+- Channel mix
+- Trending terms
 
 ## Notes
 
-- Google News RSS links are sometimes redirect URLs; the report still links correctly.
-- GDELT works more reliably over `http` than `https` in some environments, so the adapter uses the `http` endpoint intentionally.
-- GDELT can be intermittent, so the collector treats it as supplemental and fails fast instead of blocking the whole daily run.
-- Free-tier APIs often delay some articles by around 12 hours. The zero-key sources help fill that gap.
+- Upload playlist polling is much cheaper than broad YouTube search for routine collection.
+- Transcript availability is inconsistent. Some videos will be missing captions, delayed, or blocked.
+- `youtube-transcript-api` uses YouTube transcript endpoints rather than the Data API caption download flow, which makes it practical for third-party news channels but also less predictable than official metadata endpoints.
 
-## Free API References
+## References
 
-- [GDELT DOC 2.0 API](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/amp/)
-- [GNews Pricing](https://gnews.io/pricing)
-- [Currents Documentation](https://currentsapi.services/en/docs/)
-- [Alpha Vantage Documentation](https://www.alphavantage.co/documentation/)
-- [NewsData.io Latest Endpoint](https://newsdata.io/blog/latest-news-endpoint/)
-- [NewsData.io Pricing](https://newsdata.io/blog/pricing-plan-in-newsdata-io/)
+- [YouTube Data API channels.list](https://developers.google.com/youtube/v3/docs/channels/list)
+- [YouTube Data API playlistItems.list](https://developers.google.com/youtube/v3/docs/playlistItems/list)
+- [YouTube Data API videos.list](https://developers.google.com/youtube/v3/docs/videos/list)
+- [YouTube quota costs](https://developers.google.com/youtube/v3/determine_quota_cost)
+- [youtube-transcript-api on PyPI](https://pypi.org/project/youtube-transcript-api/)

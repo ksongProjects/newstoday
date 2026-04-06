@@ -1,26 +1,16 @@
-"""Default collector queries and topic definitions."""
+"""Default YouTube channels and topic definitions."""
 
 from __future__ import annotations
 
-GOOGLE_NEWS_SEARCHES = [
-    '"global economy" OR inflation OR recession OR "interest rates" OR "central bank" OR GDP',
-    '"federal reserve" OR ECB OR "Bank of England" OR "Bank of Japan" OR PBOC',
-    "trade OR tariffs OR exports OR imports OR sanctions OR supply chains",
-    '"oil prices" OR commodities OR OPEC OR gas OR copper OR wheat',
-    "jobs OR unemployment OR payrolls OR wages OR hiring",
-    '"housing market" OR consumer spending OR retail sales OR debt',
+DEFAULT_CHANNELS = [
+    {"label": "Bloomberg Television", "handle": "@BloombergTelevision"},
+    {"label": "CNBC Television", "handle": "@CNBCTelevision"},
+    {"label": "Reuters", "handle": "@Reuters"},
+    {"label": "Yahoo Finance", "handle": "@YahooFinance"},
+    {"label": "Financial Times", "handle": "@FinancialTimes"},
 ]
 
-GDELT_SEARCHES = [
-    '("global economy" OR inflation OR recession OR GDP OR unemployment OR wages OR "central bank" OR "interest rate" OR trade OR tariffs OR "oil prices" OR "financial markets")',
-]
-
-API_SEARCHES = [
-    '"global economy" OR inflation OR recession OR "central bank"',
-    "trade OR tariffs OR exports OR imports",
-    '"oil prices" OR commodities OR "financial markets"',
-    "jobs OR unemployment OR wages OR payrolls",
-]
+DEFAULT_TRANSCRIPT_LANGUAGES = ["en", "en-US", "en-GB"]
 
 TOPIC_KEYWORDS = {
     "Inflation & Rates": [
@@ -29,27 +19,26 @@ TOPIC_KEYWORDS = {
         "interest rates",
         "fed",
         "federal reserve",
-        "ecb",
+        "central bank",
         "bank of england",
         "bank of japan",
-        "central bank",
-        "monetary policy",
+        "ecb",
         "cpi",
+        "monetary policy",
     ],
     "Growth & Recession": [
+        "economy",
+        "economic",
         "gdp",
         "growth",
         "recession",
         "slowdown",
-        "contraction",
         "expansion",
-        "productivity",
         "outlook",
+        "productivity",
     ],
     "Labor & Consumers": [
         "jobs",
-        "payroll",
-        "payrolls",
         "employment",
         "unemployment",
         "wages",
@@ -57,6 +46,7 @@ TOPIC_KEYWORDS = {
         "retail",
         "housing",
         "spending",
+        "household",
         "debt",
     ],
     "Trade & Policy": [
@@ -65,11 +55,11 @@ TOPIC_KEYWORDS = {
         "tariffs",
         "exports",
         "imports",
-        "sanction",
         "sanctions",
-        "fiscal",
         "budget",
         "tax",
+        "fiscal",
+        "policy",
     ],
     "Markets & Commodities": [
         "stocks",
@@ -80,40 +70,100 @@ TOPIC_KEYWORDS = {
         "yields",
         "oil",
         "gas",
-        "commodity",
-        "commodities",
         "gold",
-        "copper",
-        "wheat",
+        "commodities",
+        "commodity",
         "currency",
         "dollar",
     ],
+    "Geopolitics & Supply": [
+        "shipping",
+        "supply chain",
+        "middle east",
+        "china",
+        "europe",
+        "conflict",
+        "war",
+        "opec",
+        "red sea",
+        "strait of hormuz",
+    ],
+}
+
+HEADLINE_KEYWORDS = {
+    keyword
+    for keywords in TOPIC_KEYWORDS.values()
+    for keyword in keywords
+}
+
+PROMO_PHRASES = {
+    "thanks for watching",
+    "thanks for joining us",
+    "welcome back",
+    "hit the like button",
+    "subscribe to our channel",
+    "download our app",
+    "turn on notifications",
+    "stick around",
+}
+
+NOISE_SNIPPETS = {
+    "[music]",
+    "[applause]",
+    "[laughter]",
+    "[__]",
 }
 
 STOPWORDS = {
     "a",
+    "about",
+    "after",
+    "all",
+    "also",
     "an",
     "and",
     "are",
     "as",
     "at",
     "be",
+    "been",
+    "but",
     "by",
     "for",
     "from",
+    "has",
+    "have",
     "in",
     "into",
     "is",
     "it",
+    "its",
+    "just",
+    "more",
+    "news",
+    "now",
     "of",
     "on",
     "or",
+    "our",
     "s",
+    "say",
+    "says",
+    "so",
     "that",
     "the",
     "their",
+    "them",
+    "they",
     "this",
     "to",
+    "today",
     "up",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
     "with",
+    "you",
 }
